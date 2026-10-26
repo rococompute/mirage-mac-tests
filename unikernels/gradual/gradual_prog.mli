@@ -24,10 +24,6 @@ val t_app : unit -> int
 
 val t_app_bad : unit -> int
 
-val l12 : __ list
-
-val l1t : __ list
-
 val t_list : unit -> int list
 
 val t_list_bad : unit -> int list
@@ -37,8 +33,6 @@ val pr : __ * __
 val t_pair : unit -> int * bool
 
 val t_pair_bad : unit -> bool * int
-
-val sf : __ option
 
 val t_option : unit -> bool option
 
@@ -73,10 +67,6 @@ val t_vec_bad : unit -> int vec
 val rep : int -> int vec
 
 val rep_dyn : __
-
-val rep_ok : int -> int vec
-
-val rep_bad : int -> int vec
 
 val t_dep : unit -> int
 
