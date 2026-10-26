@@ -31,6 +31,10 @@ val length : 'a1 list -> nat
 
 val add : nat -> nat -> nat
 
+type 'a array = 'a Stdlib.Array.t
+
+
+
 val succ_dyn : __ -> nat
 
 val apply3 : __ -> nat
@@ -128,6 +132,8 @@ val t_unk_plus : unit -> nat
 
 val t_unk_elim : unit -> nat
 
+val t_elim_mapped : unit -> bool
+
 val t_err : unit -> nat
 
 val t_err_fun : unit -> nat -> nat
@@ -139,6 +145,8 @@ val t_int : unit -> Uint63.t
 val t_int_bad : unit -> nat
 
 val t_int_float : unit -> float
+
+val t_array : unit -> bool array
 
 val delta : __ -> __
 

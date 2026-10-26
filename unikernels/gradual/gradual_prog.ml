@@ -40,20 +40,27 @@ exception Unknown_term of string
    coinductive types) raise at once instead. *)
 let exc_tag = 245
 
-let make_exc (unknown : bool) (msg : string) : Obj.t =
-  Obj.with_tag exc_tag (Obj.repr (unknown, msg))
+(* The first field of these blocks, which no other value has: testing it
+   needs no call to the C function behind [Obj.tag], so that the test
+   guarding every match stays cheap. *)
+let marker = Obj.repr (ref ())
 
-let is_exc (v : Obj.t) = Obj.is_block v && Obj.tag v = exc_tag
+let make_exc (unknown : bool) (msg : string) : Obj.t =
+  Obj.with_tag exc_tag (Obj.repr (marker, (unknown, msg)))
+
+let is_exc (v : Obj.t) = Obj.is_block v && Obj.size v = 2 && Obj.field v 0 == marker
+
+let exc_payload (v : Obj.t) : bool * string = Obj.obj (Obj.field v 1)
 
 let raise_exc (v : Obj.t) =
-  let (unknown, msg) : bool * string = Obj.obj (Obj.with_tag 0 v) in
+  let (unknown, msg) = exc_payload v in
   if unknown then raise (Unknown_term msg) else raise (Cast_error msg)
 
 (** [check v] is [v], unless [v] is [?] or [err] at an inductive type, which
     it raises. Extracted code calls it on everything it matches on. *)
 let check (v : 'a) : 'a = let r = Obj.repr v in if is_exc r then raise_exc r else v
 
-let is_unknown (v : 'a) = let r = Obj.repr v in is_exc r && fst (Obj.obj (Obj.with_tag 0 r) : bool * string)
+let is_unknown (v : 'a) = let r = Obj.repr v in is_exc r && fst (exc_payload r)
 let is_error (v : 'a) = let r = Obj.repr v in is_exc r && not (is_unknown v)
 
 (** [force v] is [v], unless [?] or [err] occurs in the data of [v] (not
@@ -62,7 +69,7 @@ let force (v : 'a) : 'a =
   let rec go r =
     if Obj.is_block r then
       let t = Obj.tag r in
-      if t = exc_tag then raise_exc r
+      if is_exc r then raise_exc r
       else if t < exc_tag then for i = 0 to Obj.size r - 1 do go (Obj.field r i) done
   in
   go (Obj.repr v); v
@@ -205,6 +212,18 @@ let rec cast a b (v : Obj.t) : Obj.t =
       end
     | _ -> fail a b
 
+(* A [match] on a value [x] that may be [?] or [err] at an inductive type
+   is extracted to [if is_exc_value x then propagate ty x else match x
+   with ...], where [ty] is the type of the match: as in the kernel, the
+   match is then [?] or [err] at [ty], which raises when [ty] cannot hold
+   it. *)
+let is_exc_value (v : 'a) = is_exc (Obj.repr v)
+
+let propagate (ty : ty) (v : 'a) : Obj.t =
+  match ty with
+  | Ind { data = true; _ } -> Obj.repr v
+  | ty -> if is_unknown v then unknown_term ty else err_term ty
+
 let cast_with fs a b v =
   List.iter (fun (name, f) ->
       if not (Hashtbl.mem casts name) then Hashtbl.add casts name f) fs;
@@ -280,16 +299,28 @@ type 'a list =
 (** val length : 'a1 list -> nat **)
 
 let rec length l =
-  match Gradual_rt.check l with
-  | Nil -> O
-  | Cons (_, l') -> S (length l')
+  if Gradual_rt.is_exc_value l
+  then
+    Obj.magic Gradual_rt.propagate
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil) l
+  else match l with
+       | Nil -> O
+       | Cons (_, l') -> S (length l')
 
 (** val add : nat -> nat -> nat **)
 
 let rec add n m =
-  match Gradual_rt.check n with
-  | O -> m
-  | S p -> S (add p m)
+  if Gradual_rt.is_exc_value n
+  then
+    Obj.magic Gradual_rt.propagate
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil) n
+  else match n with
+       | O -> m
+       | S p -> S (add p m)
+
+type 'a array = 'a Stdlib.Array.t
+
+
 
 (** val succ_dyn : __ -> nat **)
 
@@ -447,9 +478,14 @@ let t_list_bad_length _ =
 (** val t_list_bad_head : unit -> nat **)
 
 let t_list_bad_head _ =
-  match Gradual_rt.check (t_list_bad ()) with
-  | Nil -> O
-  | Cons (x, _) -> x
+  let x = t_list_bad () in
+  (if Gradual_rt.is_exc_value x
+   then
+     Obj.magic Gradual_rt.propagate
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil) x
+   else match x with
+        | Nil -> O
+        | Cons (x0, _) -> x0)
 
 (** val pr : (__, __) prod **)
 
@@ -621,9 +657,15 @@ let pt =
 (** val t_record : unit -> nat **)
 
 let t_record _ =
-  (Gradual_rt.check
-    (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil Gradual_rt.unknown_ty
-      (Gradual_rt.ind "gradual_prog.point" true Gradual_rt.anil) pt)).px
+  let p =
+    Obj.magic Gradual_rt.cast_with Gradual_rt.rnil Gradual_rt.unknown_ty
+      (Gradual_rt.ind "gradual_prog.point" true Gradual_rt.anil) pt
+  in
+  (if Gradual_rt.is_exc_value p
+   then
+     Obj.magic Gradual_rt.propagate
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil) p
+   else p.px)
 
 (** val t_record_bad : unit -> nat **)
 
@@ -838,9 +880,18 @@ let t_vec_bad _ =
 (** val rep : nat -> nat vec **)
 
 let rec rep n =
-  match Gradual_rt.check n with
-  | O -> Vnil
-  | S k -> Vcons (k, k, (rep k))
+  if Gradual_rt.is_exc_value n
+  then
+    Obj.magic Gradual_rt.propagate
+      (Gradual_rt.ind "gradual_prog.vec" true
+        (Gradual_rt.acons
+          (Gradual_rt.ty_arg
+            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+          (Gradual_rt.acons (Gradual_rt.val_arg n) Gradual_rt.anil)))
+      n
+  else match n with
+       | O -> Vnil
+       | S k -> Vcons (k, k, (rep k))
 
 (** val rep_dyn : __ **)
 
@@ -1169,7 +1220,12 @@ let t_tree_bad _ =
 (** val t_tree_bad_root : unit -> nat **)
 
 let t_tree_bad_root _ =
-  let Node (x, _) = Gradual_rt.check (t_tree_bad ()) in x
+  let x = t_tree_bad () in
+  (if Gradual_rt.is_exc_value x
+   then
+     Obj.magic Gradual_rt.propagate
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil) x
+   else let Node (x0, _) = x in x0)
 
 type 'a rose =
 | Rnode of 'a * 'a rose list
@@ -1287,6 +1343,21 @@ let t_unk_elim _ =
       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
     (S (S O))
 
+(** val t_elim_mapped : unit -> bool **)
+
+let t_elim_mapped _ =
+  let x =
+    Obj.magic Gradual_rt.unknown_term
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+  in
+  (if Gradual_rt.is_exc_value x
+   then
+     Obj.magic Gradual_rt.propagate
+       (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil) x
+   else match x with
+        | O -> true
+        | S _ -> false)
+
 (** val t_err : unit -> nat **)
 
 let t_err _ =
@@ -1332,6 +1403,17 @@ let t_int_float _ =
     (Gradual_rt.cast_with Gradual_rt.rnil (Gradual_rt.prim "int")
       Gradual_rt.unknown_ty (Obj.magic (Uint63.of_int (3))))
 
+(** val t_array : unit -> bool array **)
+
+let t_array _ =
+  Obj.magic Gradual_rt.cast_with Gradual_rt.rnil Gradual_rt.unknown_ty
+    (Gradual_rt.prim_array
+      (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil))
+    (Gradual_rt.cast_with Gradual_rt.rnil
+      (Gradual_rt.prim_array
+        (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+      Gradual_rt.unknown_ty (Obj.magic Array.make (Uint63.of_int (1)) O))
+
 (** val delta : __ -> __ **)
 
 let delta x =
@@ -1364,38 +1446,66 @@ let roundtrip a b x =
 (** val dyns : __ -> 'a1 list -> __ list **)
 
 let rec dyns a l =
-  match Gradual_rt.check l with
-  | Nil -> Nil
-  | Cons (x, r) -> Cons ((to_dyn (Obj.magic a) x), (dyns (Obj.magic a) r))
+  if Gradual_rt.is_exc_value l
+  then
+    Obj.magic Gradual_rt.propagate
+      (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
+        (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
+      l
+  else
+    match l with
+    | Nil -> Nil
+    | Cons (x, r) -> Cons ((to_dyn (Obj.magic a) x), (dyns (Obj.magic a) r))
 
 (** val dyns_local : __ -> 'a1 list -> __ list **)
 
 let rec dyns_local a l =
-  match Gradual_rt.check l with
-  | Nil -> Nil
-  | Cons (x, r) ->
-    Cons
-      ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil a
-         Gradual_rt.unknown_ty x),
-      (dyns_local a r))
+  if Gradual_rt.is_exc_value l
+  then
+    Obj.magic Gradual_rt.propagate
+      (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
+        (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
+      l
+  else
+    match l with
+    | Nil -> Nil
+    | Cons (x, r) ->
+      Cons
+        ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil a
+           Gradual_rt.unknown_ty x),
+        (dyns_local a r))
 
 (** val ev : __ -> 'a1 list -> __ list **)
 
 let rec ev a l =
-  match Gradual_rt.check l with
-  | Nil -> Nil
-  | Cons (x, r) -> Cons ((to_dyn (Obj.magic a) x), (od (Obj.magic a) r))
+  if Gradual_rt.is_exc_value l
+  then
+    Obj.magic Gradual_rt.propagate
+      (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
+        (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
+      l
+  else
+    match l with
+    | Nil -> Nil
+    | Cons (x, r) -> Cons ((to_dyn (Obj.magic a) x), (od (Obj.magic a) r))
 
 (** val od : __ -> 'a1 list -> __ list **)
 
 and od a l =
-  match Gradual_rt.check l with
-  | Nil -> Nil
-  | Cons (x, r) ->
-    Cons
-      ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil a
-         Gradual_rt.unknown_ty x),
-      (ev (Obj.magic a) r))
+  if Gradual_rt.is_exc_value l
+  then
+    Obj.magic Gradual_rt.propagate
+      (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
+        (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
+      l
+  else
+    match l with
+    | Nil -> Nil
+    | Cons (x, r) ->
+      Cons
+        ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil a
+           Gradual_rt.unknown_ty x),
+        (ev (Obj.magic a) r))
 
 (** val poly_fun : __ -> ('a1 -> 'a1) -> __ **)
 
