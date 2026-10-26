@@ -26,12 +26,46 @@ module Gradual_rt = struct
    extracted code also builds for MirageOS unikernels. *)
 
 exception Cast_error of string
-(** The error [err_A] was reached: a cast failed at run time. *)
+(** The error [err_A] was eliminated: a cast failed at run time. *)
 
 exception Unknown_term of string
-(** The unknown term [?_A] at an inductive type was evaluated. Extracted
-    code is call-by-value and cannot represent [?_A] as a value of [A], so
-    this is raised instead. *)
+(** The unknown term [?_A] at an inductive type was eliminated. *)
+
+(* As in the kernel, [?_I] and [err_I] at an inductive type [I] are values:
+   [cons raise nil] is a list, and [2 + ?] is [S (S ?)]. They are blocks
+   with a tag that no extracted constructor uses, holding their kind and a
+   message, and they raise only when eliminated: every [match] of a file
+   that uses this runtime goes through [check]. Types whose values cannot
+   hold them (mapped to OCaml types by Extract Inductive, singleton and
+   coinductive types) raise at once instead. *)
+let exc_tag = 245
+
+let make_exc (unknown : bool) (msg : string) : Obj.t =
+  Obj.with_tag exc_tag (Obj.repr (unknown, msg))
+
+let is_exc (v : Obj.t) = Obj.is_block v && Obj.tag v = exc_tag
+
+let raise_exc (v : Obj.t) =
+  let (unknown, msg) : bool * string = Obj.obj (Obj.with_tag 0 v) in
+  if unknown then raise (Unknown_term msg) else raise (Cast_error msg)
+
+(** [check v] is [v], unless [v] is [?] or [err] at an inductive type, which
+    it raises. Extracted code calls it on everything it matches on. *)
+let check (v : 'a) : 'a = let r = Obj.repr v in if is_exc r then raise_exc r else v
+
+let is_unknown (v : 'a) = let r = Obj.repr v in is_exc r && fst (Obj.obj (Obj.with_tag 0 r) : bool * string)
+let is_error (v : 'a) = let r = Obj.repr v in is_exc r && not (is_unknown v)
+
+(** [force v] is [v], unless [?] or [err] occurs in the data of [v] (not
+    under functions), which it raises. *)
+let force (v : 'a) : 'a =
+  let rec go r =
+    if Obj.is_block r then
+      let t = Obj.tag r in
+      if t = exc_tag then raise_exc r
+      else if t < exc_tag then for i = 0 to Obj.size r - 1 do go (Obj.field r i) done
+  in
+  go (Obj.repr v); v
 
 type ty =
   | Unknown
@@ -43,6 +77,7 @@ type ty =
 
 and ind = {
   name : string;
+  data : bool;  (* its values can be [?] and [err] (see [exc_tag]) *)
   args : arg array;  (* parameters, then indices *)
 }
 
@@ -81,8 +116,13 @@ and arg_to_string = function
   | Unk -> "?"
   | Error -> "err"
 
-let fail a b =
-  raise (Cast_error ("cannot cast from " ^ to_string a ^ " to " ^ to_string b))
+(* [err] at type [b]: a value when [b] is an inductive type that can hold
+   it. *)
+let error_at b msg = match b with
+  | Ind { data = true; _ } -> make_exc false msg
+  | _ -> raise (Cast_error msg)
+
+let fail a b = error_at b ("cannot cast from " ^ to_string a ^ " to " ^ to_string b)
 
 let same_value (a : Obj.t) (b : Obj.t) =
   a == b || (try compare a b = 0 with Invalid_argument _ -> false)
@@ -109,17 +149,24 @@ let rec unknown_term ty : Obj.t = match ty with
   | Unknown -> Obj.repr { dty = Unknown; dv = dummy }
   | Erased | Sort _ -> dummy
   | Pi (_, b) -> Obj.repr (fun x -> unknown_term (b x))
-  | Ind i -> raise (Unknown_term i.name)
+  | Ind i -> if i.data then make_exc true i.name else raise (Unknown_term i.name)
   | Err -> raise (Cast_error "unknown term of the error type")
 
 let rec err_term ty : Obj.t = match ty with
   | Unknown -> Obj.repr { dty = Err; dv = dummy }
   | Erased | Sort _ -> dummy
   | Pi (_, b) -> Obj.repr (fun x -> err_term (b x))
-  | Ind _ | Err -> raise (Cast_error ("error at type " ^ to_string ty))
+  | Ind _ | Err -> error_at ty ("error at type " ^ to_string ty)
 
 let rec cast a b (v : Obj.t) : Obj.t =
   if equal a b then v
+  else if is_exc v then
+    (* [?_A] and [err_A] cast to [B] are [?_B] and [err_B] *)
+    begin match b with
+      | Ind { data = true; _ } -> v
+      | Unknown -> Obj.repr { dty = (if is_unknown v then Unknown else Err); dv = dummy }
+      | _ -> raise_exc v
+    end
   else match a, b with
     | Err, _ | _, Err -> fail a b
     | Erased, Erased -> v
@@ -156,13 +203,16 @@ let cast_with fs a b v =
 (* The indices computed for a rebuilt constructor must be compatible with
    the indices of the target type ([?] is compatible with anything). *)
 let check_indices tgt nparams computed v =
-  List.iteri (fun k c ->
-      match tgt.args.(nparams + k), c with
-      | Unk, _ | _, Unk | Ty _, _ | _, Ty _ -> ()
-      | Val i, Val c when same_value i c -> ()
-      | _ -> raise (Cast_error ("index mismatch at type " ^ to_string (Ind tgt))))
-    computed;
-  v
+  let compatible k c = match tgt.args.(nparams + k), c with
+    | Unk, _ | _, Unk | Ty _, _ | _, Ty _ -> true
+    | Val i, Val c ->
+      (* an index computed as [?] is compatible with anything *)
+      if is_exc c || is_exc i then is_unknown c || is_unknown i
+      else same_value i c
+    | (Val _ | Error), _ -> false
+  in
+  if List.for_all Fun.id (List.mapi compatible computed) then v
+  else error_at (Ind tgt) ("index mismatch at type " ^ to_string (Ind tgt))
 
 (* Builders used by the extracted code. *)
 let unknown_ty = Unknown
@@ -170,7 +220,7 @@ let err_ty = Err
 let erased = Erased
 let sort n = Sort n
 let pi a b = Pi (a, b)
-let ind name args = Ind { name; args = Array.of_list args }
+let ind name data args = Ind { name; data; args = Array.of_list args }
 let rnil : (string * (ind -> ind -> Obj.t -> Obj.t)) list = []
 let rcons name f l = (name, f) :: l
 let anil : arg list = []
@@ -200,183 +250,212 @@ let negb = function
 | true -> false
 | false -> true
 
+type nat =
+| O
+| S of nat
 
+type 'a option =
+| Some of 'a
+| None
 
-(** val add : int -> int -> int **)
+type ('a, 'b) prod =
+| Pair of 'a * 'b
+
+type 'a list =
+| Nil
+| Cons of 'a * 'a list
+
+(** val length : 'a1 list -> nat **)
+
+let rec length l =
+  match Gradual_rt.check l with
+  | Nil -> O
+  | Cons (_, l') -> S (length l')
+
+(** val add : nat -> nat -> nat **)
 
 let rec add n m =
-  (fun fO fS n -> if n = 0 then fO () else fS (n - 1))
-    (fun _ -> m)
-    (fun p -> succ (add p m))
-    n
+  match Gradual_rt.check n with
+  | O -> m
+  | S p -> S (add p m)
 
-(** val succ_dyn : __ -> int **)
+(** val succ_dyn : __ -> nat **)
 
 let succ_dyn x =
   add
     (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil Gradual_rt.unknown_ty
-      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil) x)
-    (succ 0)
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil) x)
+    (S O)
 
-(** val apply3 : __ -> int **)
+(** val apply3 : __ -> nat **)
 
 let apply3 g =
   Obj.magic Gradual_rt.cast_with Gradual_rt.rnil Gradual_rt.unknown_ty
-    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
+    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
     (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil Gradual_rt.unknown_ty
       (Gradual_rt.pi Gradual_rt.unknown_ty (fun _ -> Gradual_rt.unknown_ty))
       g
       (Gradual_rt.cast_with Gradual_rt.rnil
-        (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-        Gradual_rt.unknown_ty (Obj.magic (succ (succ (succ 0))))))
+        (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+        Gradual_rt.unknown_ty (Obj.magic (S (S (S O))))))
 
-(** val t_ok : unit -> int **)
+(** val t_ok : unit -> nat **)
 
 let t_ok _ =
   succ_dyn
     (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-      Gradual_rt.unknown_ty (succ (succ (succ (succ (succ (succ (succ (succ
-      (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ
-      (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ
-      (succ (succ (succ (succ (succ (succ (succ (succ (succ
-      0))))))))))))))))))))))))))))))))))))))))))
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+      Gradual_rt.unknown_ty (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S
+      (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S
+      (S O))))))))))))))))))))))))))))))))))))))))))
 
-(** val t_bad : unit -> int **)
+(** val t_bad : unit -> nat **)
 
 let t_bad _ =
   succ_dyn
     (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-      (Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil)
+      (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil)
       Gradual_rt.unknown_ty true)
 
-(** val t_app : unit -> int **)
+(** val t_app : unit -> nat **)
 
 let t_app _ =
   apply3
     (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
       (Gradual_rt.pi
-        (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
+        (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
         (fun _ ->
-        Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
-      Gradual_rt.unknown_ty (fun x -> succ x))
+        Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+      Gradual_rt.unknown_ty (fun x -> S x))
 
-(** val t_app_bad : unit -> int **)
+(** val t_app_bad : unit -> nat **)
 
 let t_app_bad _ =
   apply3
     (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
       (Gradual_rt.pi
-        (Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil)
+        (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil)
         (fun _ ->
-        Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil))
+        Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil))
       Gradual_rt.unknown_ty negb)
 
-(** val t_list : unit -> int list **)
+(** val t_list : unit -> nat list **)
 
 let t_list _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.list" (fun src tgt v ->
-      match Obj.magic v with
-      | [] -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic [])
-      | x::x0 ->
+      match Gradual_rt.check (Obj.magic v) with
+      | Nil -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Nil)
+      | Cons (x, x0) ->
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
             (Obj.magic x0)
         in
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
-          (Obj.magic ((Obj.magic x1)::(Obj.magic x2))))
+          (Obj.magic (Cons ((Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         Gradual_rt.anil))
+    (Cons
     ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-       Gradual_rt.unknown_ty (succ 0))::((Obj.magic Gradual_rt.cast_with
-                                           Gradual_rt.rnil
-                                           (Gradual_rt.ind
-                                             "Corelib.Init.Datatypes.nat"
-                                             Gradual_rt.anil)
-                                           Gradual_rt.unknown_ty (succ (succ
-                                           0)))::[]))
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+       Gradual_rt.unknown_ty (S O)),
+    (Cons
+    ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+       Gradual_rt.unknown_ty (S (S O))),
+    Nil))))
 
-(** val t_list_bad : unit -> int list **)
+(** val t_list_bad : unit -> nat list **)
 
 let t_list_bad _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.list" (fun src tgt v ->
-      match Obj.magic v with
-      | [] -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic [])
-      | x::x0 ->
+      match Gradual_rt.check (Obj.magic v) with
+      | Nil -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Nil)
+      | Cons (x, x0) ->
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
             (Obj.magic x0)
         in
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
-          (Obj.magic ((Obj.magic x1)::(Obj.magic x2))))
+          (Obj.magic (Cons ((Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         Gradual_rt.anil))
+    (Cons
     ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-       Gradual_rt.unknown_ty (succ 0))::((Obj.magic Gradual_rt.cast_with
-                                           Gradual_rt.rnil
-                                           (Gradual_rt.ind
-                                             "Corelib.Init.Datatypes.bool"
-                                             Gradual_rt.anil)
-                                           Gradual_rt.unknown_ty true)::[]))
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+       Gradual_rt.unknown_ty (S O)),
+    (Cons
+    ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
+       (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil)
+       Gradual_rt.unknown_ty true),
+    Nil))))
 
-(** val pr : __ * __ **)
+(** val t_list_bad_length : unit -> nat **)
+
+let t_list_bad_length _ =
+  length (t_list_bad ())
+
+(** val t_list_bad_head : unit -> nat **)
+
+let t_list_bad_head _ =
+  match Gradual_rt.check (t_list_bad ()) with
+  | Nil -> O
+  | Cons (x, _) -> x
+
+(** val pr : (__, __) prod **)
 
 let pr =
-  (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-    Gradual_rt.unknown_ty (succ 0)),(Obj.magic Gradual_rt.cast_with
-                                      Gradual_rt.rnil
-                                      (Gradual_rt.ind
-                                        "Corelib.Init.Datatypes.bool"
-                                        Gradual_rt.anil)
-                                      Gradual_rt.unknown_ty true)
+  Pair
+    ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+       Gradual_rt.unknown_ty (S O)),
+    (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
+      (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil)
+      Gradual_rt.unknown_ty true))
 
-(** val t_pair : unit -> int * bool **)
+(** val t_pair : unit -> (nat, bool) prod **)
 
 let t_pair _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.prod" (fun src tgt v ->
-      let x,x0 = Obj.magic v in
+      let Pair (x, x0) = Gradual_rt.check (Obj.magic v) in
       let x1 =
         Gradual_rt.cast (Gradual_rt.param_ty src 0)
           (Gradual_rt.param_ty tgt 0) (Obj.magic x)
@@ -386,27 +465,28 @@ let t_pair _ =
           (Gradual_rt.param_ty tgt 1) (Obj.magic x0)
       in
       Gradual_rt.check_indices tgt 2 Gradual_rt.anil
-        (Obj.magic ((Obj.magic x1),(Obj.magic x2))))
+        (Obj.magic (Pair ((Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.prod"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.prod" true
       (Gradual_rt.acons Gradual_rt.unk_arg
         (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil)))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.prod"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.prod" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         (Gradual_rt.acons
           (Gradual_rt.ty_arg
-            (Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil))
+            (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false
+              Gradual_rt.anil))
           Gradual_rt.anil)))
     pr
 
-(** val t_pair_bad : unit -> bool * int **)
+(** val t_pair_bad : unit -> (bool, nat) prod **)
 
 let t_pair_bad _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.prod" (fun src tgt v ->
-      let x,x0 = Obj.magic v in
+      let Pair (x, x0) = Gradual_rt.check (Obj.magic v) in
       let x1 =
         Gradual_rt.cast (Gradual_rt.param_ty src 0)
           (Gradual_rt.param_ty tgt 0) (Obj.magic x)
@@ -416,18 +496,18 @@ let t_pair_bad _ =
           (Gradual_rt.param_ty tgt 1) (Obj.magic x0)
       in
       Gradual_rt.check_indices tgt 2 Gradual_rt.anil
-        (Obj.magic ((Obj.magic x1),(Obj.magic x2))))
+        (Obj.magic (Pair ((Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.prod"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.prod" true
       (Gradual_rt.acons Gradual_rt.unk_arg
         (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil)))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.prod"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.prod" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil))
         (Gradual_rt.acons
           (Gradual_rt.ty_arg
-            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
           Gradual_rt.anil)))
     pr
 
@@ -436,7 +516,7 @@ let t_pair_bad _ =
 let t_option _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.option" (fun src tgt v ->
-      match Obj.magic v with
+      match Gradual_rt.check (Obj.magic v) with
       | Some x ->
         let x0 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
@@ -447,97 +527,97 @@ let t_option _ =
       | None ->
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic None))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.option"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.option" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.option"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.option" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil))
         Gradual_rt.anil))
     (Some
     (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-      (Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil)
+      (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil)
       Gradual_rt.unknown_ty false))
 
 (** val fs : __ list **)
 
 let fs =
-  (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-    (Gradual_rt.pi
-      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil) (fun _ ->
-      Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
-    Gradual_rt.unknown_ty (fun x -> succ x))::((Obj.magic
-                                                 Gradual_rt.cast_with
-                                                 Gradual_rt.rnil
-                                                 (Gradual_rt.pi
-                                                   (Gradual_rt.ind
-                                                     "Corelib.Init.Datatypes.bool"
-                                                     Gradual_rt.anil)
-                                                   (fun _ ->
-                                                   Gradual_rt.ind
-                                                     "Corelib.Init.Datatypes.bool"
-                                                     Gradual_rt.anil))
-                                                 Gradual_rt.unknown_ty negb)::[])
+  Cons
+    ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
+       (Gradual_rt.pi
+         (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+         (fun _ ->
+         Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+       Gradual_rt.unknown_ty (fun x -> S x)),
+    (Cons
+    ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
+       (Gradual_rt.pi
+         (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil)
+         (fun _ ->
+         Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil))
+       Gradual_rt.unknown_ty negb),
+    Nil)))
 
-(** val t_fs : unit -> (int -> int) list **)
+(** val t_fs : unit -> (nat -> nat) list **)
 
 let t_fs _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.list" (fun src tgt v ->
-      match Obj.magic v with
-      | [] -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic [])
-      | x::x0 ->
+      match Gradual_rt.check (Obj.magic v) with
+      | Nil -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Nil)
+      | Cons (x, x0) ->
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
             (Obj.magic x0)
         in
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
-          (Obj.magic ((Obj.magic x1)::(Obj.magic x2))))
+          (Obj.magic (Cons ((Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
           (Gradual_rt.pi
-            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
+            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
             (fun _ ->
-            Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)))
+            Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)))
         Gradual_rt.anil))
     fs
 
-type point = { px : int; py : bool }
+type point = { px : nat; py : bool }
 
 (** val pt : __ **)
 
 let pt =
   Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-    (Gradual_rt.ind "gradual_prog.point" Gradual_rt.anil)
-    Gradual_rt.unknown_ty { px = (succ 0); py = true }
+    (Gradual_rt.ind "gradual_prog.point" true Gradual_rt.anil)
+    Gradual_rt.unknown_ty { px = (S O); py = true }
 
-(** val t_record : unit -> int **)
+(** val t_record : unit -> nat **)
 
 let t_record _ =
-  (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil Gradual_rt.unknown_ty
-    (Gradual_rt.ind "gradual_prog.point" Gradual_rt.anil) pt).px
+  (Gradual_rt.check
+    (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil Gradual_rt.unknown_ty
+      (Gradual_rt.ind "gradual_prog.point" true Gradual_rt.anil) pt)).px
 
-(** val t_record_bad : unit -> int **)
+(** val t_record_bad : unit -> nat **)
 
 let t_record_bad _ =
   Obj.magic Gradual_rt.cast_with Gradual_rt.rnil Gradual_rt.unknown_ty
-    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil) pt
+    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil) pt
 
 (** val pos : __ **)
 
@@ -550,14 +630,14 @@ let pos =
       in
       Gradual_rt.check_indices tgt 2 Gradual_rt.anil (Obj.magic x))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Specif.sig"
+    (Gradual_rt.ind "Corelib.Init.Specif.sig" false
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         (Gradual_rt.acons Gradual_rt.erased_arg Gradual_rt.anil)))
-    Gradual_rt.unknown_ty (succ 0)
+    Gradual_rt.unknown_ty (S O)
 
-(** val t_sig : unit -> int **)
+(** val t_sig : unit -> nat **)
 
 let t_sig _ =
   Obj.magic Gradual_rt.cast_with
@@ -569,32 +649,33 @@ let t_sig _ =
       Gradual_rt.check_indices tgt 2 Gradual_rt.anil (Obj.magic x))
       Gradual_rt.rnil)
     Gradual_rt.unknown_ty
-    (Gradual_rt.ind "Corelib.Init.Specif.sig"
+    (Gradual_rt.ind "Corelib.Init.Specif.sig" false
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         (Gradual_rt.acons Gradual_rt.erased_arg Gradual_rt.anil)))
     pos
 
 type 'a vec =
 | Vnil
-| Vcons of int * 'a * 'a vec
+| Vcons of nat * 'a * 'a vec
 
-(** val vhead : int -> 'a1 vec -> 'a1 **)
+(** val vhead : nat -> 'a1 vec -> 'a1 **)
 
-let vhead _ = function
-| Vnil -> Obj.magic ()
-| Vcons (_, x, _) -> x
+let vhead _ v =
+  match Gradual_rt.check v with
+  | Vnil -> Obj.magic ()
+  | Vcons (_, x, _) -> x
 
-(** val v3 : int vec **)
+(** val v3 : nat vec **)
 
 let v3 =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "gradual_prog.vec" (fun src tgt v ->
-      match Obj.magic v with
+      match Gradual_rt.check (Obj.magic v) with
       | Vnil ->
         Gradual_rt.check_indices tgt 1
-          (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic 0))
+          (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic O))
             Gradual_rt.anil)
           (Obj.magic Vnil)
       | Vcons (n, x, x0) ->
@@ -604,13 +685,13 @@ let v3 =
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "gradual_prog.vec"
+            (Gradual_rt.ind "gradual_prog.vec" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 (Gradual_rt.acons
                   (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic n0))
                   Gradual_rt.anil)))
-            (Gradual_rt.ind "gradual_prog.vec"
+            (Gradual_rt.ind "gradual_prog.vec" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 (Gradual_rt.acons
@@ -620,34 +701,33 @@ let v3 =
         in
         Gradual_rt.check_indices tgt 1
           (Gradual_rt.acons
-            (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (succ n0)))
+            (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (S n0)))
             Gradual_rt.anil)
           (Obj.magic (Vcons ((Obj.magic n), (Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "gradual_prog.vec"
+    (Gradual_rt.ind "gradual_prog.vec" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
-        (Gradual_rt.acons (Gradual_rt.val_arg (succ (succ (succ 0))))
-          Gradual_rt.anil)))
-    (Gradual_rt.ind "gradual_prog.vec"
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+        (Gradual_rt.acons (Gradual_rt.val_arg (S (S (S O)))) Gradual_rt.anil)))
+    (Gradual_rt.ind "gradual_prog.vec" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil)))
-    (Vcons ((succ (succ 0)), (succ 0), (Vcons ((succ 0), (succ (succ 0)),
-    (Vcons (0, (succ (succ (succ 0))), Vnil))))))
+    (Vcons ((S (S O)), (S O), (Vcons ((S O), (S (S O)), (Vcons (O, (S (S (S
+    O))), Vnil))))))
 
-(** val t_vec : unit -> int **)
+(** val t_vec : unit -> nat **)
 
 let t_vec _ =
-  vhead (succ (succ 0))
+  vhead (S (S O))
     (Obj.magic Gradual_rt.cast_with
       (Gradual_rt.rcons "gradual_prog.vec" (fun src tgt v ->
-        match Obj.magic v with
+        match Gradual_rt.check (Obj.magic v) with
         | Vnil ->
           Gradual_rt.check_indices tgt 1
-            (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic 0))
+            (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic O))
               Gradual_rt.anil)
             (Obj.magic Vnil)
         | Vcons (n, x, x0) ->
@@ -657,14 +737,14 @@ let t_vec _ =
           in
           let x2 =
             Gradual_rt.cast
-              (Gradual_rt.ind "gradual_prog.vec"
+              (Gradual_rt.ind "gradual_prog.vec" true
                 (Gradual_rt.acons
                   (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                   (Gradual_rt.acons
                     (Gradual_rt.val_arg
                       (let n0 = Obj.magic n in Obj.magic n0))
                     Gradual_rt.anil)))
-              (Gradual_rt.ind "gradual_prog.vec"
+              (Gradual_rt.ind "gradual_prog.vec" true
                 (Gradual_rt.acons
                   (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                   (Gradual_rt.acons
@@ -675,34 +755,33 @@ let t_vec _ =
           in
           Gradual_rt.check_indices tgt 1
             (Gradual_rt.acons
-              (Gradual_rt.val_arg
-                (let n0 = Obj.magic n in Obj.magic (succ n0)))
+              (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (S n0)))
               Gradual_rt.anil)
             (Obj.magic (Vcons ((Obj.magic n), (Obj.magic x1),
               (Obj.magic x2)))))
         Gradual_rt.rnil)
-      (Gradual_rt.ind "gradual_prog.vec"
+      (Gradual_rt.ind "gradual_prog.vec" true
         (Gradual_rt.acons
           (Gradual_rt.ty_arg
-            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
           (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil)))
-      (Gradual_rt.ind "gradual_prog.vec"
+      (Gradual_rt.ind "gradual_prog.vec" true
         (Gradual_rt.acons
           (Gradual_rt.ty_arg
-            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
-          (Gradual_rt.acons (Gradual_rt.val_arg (succ (succ (succ 0))))
+            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+          (Gradual_rt.acons (Gradual_rt.val_arg (S (S (S O))))
             Gradual_rt.anil)))
       v3)
 
-(** val t_vec_bad : unit -> int vec **)
+(** val t_vec_bad : unit -> nat vec **)
 
 let t_vec_bad _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "gradual_prog.vec" (fun src tgt v ->
-      match Obj.magic v with
+      match Gradual_rt.check (Obj.magic v) with
       | Vnil ->
         Gradual_rt.check_indices tgt 1
-          (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic 0))
+          (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic O))
             Gradual_rt.anil)
           (Obj.magic Vnil)
       | Vcons (n, x, x0) ->
@@ -712,13 +791,13 @@ let t_vec_bad _ =
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "gradual_prog.vec"
+            (Gradual_rt.ind "gradual_prog.vec" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 (Gradual_rt.acons
                   (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic n0))
                   Gradual_rt.anil)))
-            (Gradual_rt.ind "gradual_prog.vec"
+            (Gradual_rt.ind "gradual_prog.vec" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 (Gradual_rt.acons
@@ -728,40 +807,38 @@ let t_vec_bad _ =
         in
         Gradual_rt.check_indices tgt 1
           (Gradual_rt.acons
-            (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (succ n0)))
+            (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (S n0)))
             Gradual_rt.anil)
           (Obj.magic (Vcons ((Obj.magic n), (Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "gradual_prog.vec"
+    (Gradual_rt.ind "gradual_prog.vec" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil)))
-    (Gradual_rt.ind "gradual_prog.vec"
+    (Gradual_rt.ind "gradual_prog.vec" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
-        (Gradual_rt.acons (Gradual_rt.val_arg (succ (succ 0)))
-          Gradual_rt.anil)))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+        (Gradual_rt.acons (Gradual_rt.val_arg (S (S O))) Gradual_rt.anil)))
     v3
 
-(** val rep : int -> int vec **)
+(** val rep : nat -> nat vec **)
 
 let rec rep n =
-  (fun fO fS n -> if n = 0 then fO () else fS (n - 1))
-    (fun _ -> Vnil)
-    (fun k -> Vcons (k, k, (rep k)))
-    n
+  match Gradual_rt.check n with
+  | O -> Vnil
+  | S k -> Vcons (k, k, (rep k))
 
 (** val rep_dyn : __ **)
 
 let rep_dyn =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "gradual_prog.vec" (fun src tgt v ->
-      match Obj.magic v with
+      match Gradual_rt.check (Obj.magic v) with
       | Vnil ->
         Gradual_rt.check_indices tgt 1
-          (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic 0))
+          (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic O))
             Gradual_rt.anil)
           (Obj.magic Vnil)
       | Vcons (n, x, x0) ->
@@ -771,13 +848,13 @@ let rep_dyn =
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "gradual_prog.vec"
+            (Gradual_rt.ind "gradual_prog.vec" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 (Gradual_rt.acons
                   (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic n0))
                   Gradual_rt.anil)))
-            (Gradual_rt.ind "gradual_prog.vec"
+            (Gradual_rt.ind "gradual_prog.vec" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 (Gradual_rt.acons
@@ -787,31 +864,32 @@ let rep_dyn =
         in
         Gradual_rt.check_indices tgt 1
           (Gradual_rt.acons
-            (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (succ n0)))
+            (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (S n0)))
             Gradual_rt.anil)
           (Obj.magic (Vcons ((Obj.magic n), (Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
     (Gradual_rt.pi
-      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil) (fun n ->
-      Gradual_rt.ind "gradual_prog.vec"
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+      (fun n ->
+      Gradual_rt.ind "gradual_prog.vec" true
         (Gradual_rt.acons
           (Gradual_rt.ty_arg
-            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+            (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
           (Gradual_rt.acons
             (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic n0))
             Gradual_rt.anil))))
     Gradual_rt.unknown_ty rep
 
-(** val t_dep : unit -> int **)
+(** val t_dep : unit -> nat **)
 
 let t_dep _ =
-  vhead (succ (succ 0))
+  vhead (S (S O))
     (Obj.magic Gradual_rt.cast_with
       (Gradual_rt.rcons "gradual_prog.vec" (fun src tgt v ->
-        match Obj.magic v with
+        match Gradual_rt.check (Obj.magic v) with
         | Vnil ->
           Gradual_rt.check_indices tgt 1
-            (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic 0))
+            (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic O))
               Gradual_rt.anil)
             (Obj.magic Vnil)
         | Vcons (n, x, x0) ->
@@ -821,14 +899,14 @@ let t_dep _ =
           in
           let x2 =
             Gradual_rt.cast
-              (Gradual_rt.ind "gradual_prog.vec"
+              (Gradual_rt.ind "gradual_prog.vec" true
                 (Gradual_rt.acons
                   (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                   (Gradual_rt.acons
                     (Gradual_rt.val_arg
                       (let n0 = Obj.magic n in Obj.magic n0))
                     Gradual_rt.anil)))
-              (Gradual_rt.ind "gradual_prog.vec"
+              (Gradual_rt.ind "gradual_prog.vec" true
                 (Gradual_rt.acons
                   (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                   (Gradual_rt.acons
@@ -839,35 +917,35 @@ let t_dep _ =
           in
           Gradual_rt.check_indices tgt 1
             (Gradual_rt.acons
-              (Gradual_rt.val_arg
-                (let n0 = Obj.magic n in Obj.magic (succ n0)))
+              (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (S n0)))
               Gradual_rt.anil)
             (Obj.magic (Vcons ((Obj.magic n), (Obj.magic x1),
               (Obj.magic x2)))))
         Gradual_rt.rnil)
       Gradual_rt.unknown_ty
       (Gradual_rt.pi
-        (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
+        (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
         (fun n ->
-        Gradual_rt.ind "gradual_prog.vec"
+        Gradual_rt.ind "gradual_prog.vec" true
           (Gradual_rt.acons
             (Gradual_rt.ty_arg
-              (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+              (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
+                Gradual_rt.anil))
             (Gradual_rt.acons
               (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic n0))
               Gradual_rt.anil))))
-      rep_dyn (succ (succ (succ 0))))
+      rep_dyn (S (S (S O))))
 
-(** val t_dep_bad : unit -> int **)
+(** val t_dep_bad : unit -> nat **)
 
 let t_dep_bad _ =
-  vhead (succ (succ (succ 0)))
+  vhead (S (S (S O)))
     (Obj.magic Gradual_rt.cast_with
       (Gradual_rt.rcons "gradual_prog.vec" (fun src tgt v ->
-        match Obj.magic v with
+        match Gradual_rt.check (Obj.magic v) with
         | Vnil ->
           Gradual_rt.check_indices tgt 1
-            (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic 0))
+            (Gradual_rt.acons (Gradual_rt.val_arg (Obj.magic O))
               Gradual_rt.anil)
             (Obj.magic Vnil)
         | Vcons (n, x, x0) ->
@@ -877,14 +955,14 @@ let t_dep_bad _ =
           in
           let x2 =
             Gradual_rt.cast
-              (Gradual_rt.ind "gradual_prog.vec"
+              (Gradual_rt.ind "gradual_prog.vec" true
                 (Gradual_rt.acons
                   (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                   (Gradual_rt.acons
                     (Gradual_rt.val_arg
                       (let n0 = Obj.magic n in Obj.magic n0))
                     Gradual_rt.anil)))
-              (Gradual_rt.ind "gradual_prog.vec"
+              (Gradual_rt.ind "gradual_prog.vec" true
                 (Gradual_rt.acons
                   (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                   (Gradual_rt.acons
@@ -895,25 +973,24 @@ let t_dep_bad _ =
           in
           Gradual_rt.check_indices tgt 1
             (Gradual_rt.acons
-              (Gradual_rt.val_arg
-                (let n0 = Obj.magic n in Obj.magic (succ n0)))
+              (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (S n0)))
               Gradual_rt.anil)
             (Obj.magic (Vcons ((Obj.magic n), (Obj.magic x1),
               (Obj.magic x2)))))
         Gradual_rt.rnil)
       Gradual_rt.unknown_ty
       (Gradual_rt.pi
-        (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
+        (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
         (fun n ->
-        Gradual_rt.ind "gradual_prog.vec"
+        Gradual_rt.ind "gradual_prog.vec" true
           (Gradual_rt.acons
             (Gradual_rt.ty_arg
-              (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+              (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
+                Gradual_rt.anil))
             (Gradual_rt.acons
-              (Gradual_rt.val_arg
-                (let n0 = Obj.magic n in Obj.magic (succ n0)))
+              (Gradual_rt.val_arg (let n0 = Obj.magic n in Obj.magic (S n0)))
               Gradual_rt.anil))))
-      rep_dyn (succ (succ (succ 0))))
+      rep_dyn (S (S (S O))))
 
 type 'a tree =
 | Node of 'a * 'a forest
@@ -926,30 +1003,30 @@ and 'a forest =
 let tr =
   Node
     ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-       Gradual_rt.unknown_ty (succ 0)),
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+       Gradual_rt.unknown_ty (S O)),
     (Fcons ((Node
     ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-       Gradual_rt.unknown_ty (succ (succ 0))),
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+       Gradual_rt.unknown_ty (S (S O))),
     Fnil)), Fnil)))
 
-(** val t_tree : unit -> int tree **)
+(** val t_tree : unit -> nat tree **)
 
 let t_tree _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "gradual_prog.tree#forest" (fun src tgt v ->
-      match Obj.magic v with
+      match Gradual_rt.check (Obj.magic v) with
       | Fnil ->
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Fnil)
       | Fcons (x, x0) ->
         let x1 =
           Gradual_rt.cast
-            (Gradual_rt.ind "gradual_prog.tree#tree"
+            (Gradual_rt.ind "gradual_prog.tree#tree" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "gradual_prog.tree#tree"
+            (Gradual_rt.ind "gradual_prog.tree#tree" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
@@ -957,11 +1034,11 @@ let t_tree _ =
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "gradual_prog.tree#forest"
+            (Gradual_rt.ind "gradual_prog.tree#forest" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "gradual_prog.tree#forest"
+            (Gradual_rt.ind "gradual_prog.tree#forest" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
@@ -970,18 +1047,18 @@ let t_tree _ =
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
           (Obj.magic (Fcons ((Obj.magic x1), (Obj.magic x2)))))
       (Gradual_rt.rcons "gradual_prog.tree#tree" (fun src tgt v ->
-        let Node (x, x0) = Obj.magic v in
+        let Node (x, x0) = Gradual_rt.check (Obj.magic v) in
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "gradual_prog.tree#forest"
+            (Gradual_rt.ind "gradual_prog.tree#forest" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "gradual_prog.tree#forest"
+            (Gradual_rt.ind "gradual_prog.tree#forest" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
@@ -990,12 +1067,12 @@ let t_tree _ =
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
           (Obj.magic (Node ((Obj.magic x1), (Obj.magic x2)))))
         Gradual_rt.rnil))
-    (Gradual_rt.ind "gradual_prog.tree#tree"
+    (Gradual_rt.ind "gradual_prog.tree#tree" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "gradual_prog.tree#tree"
+    (Gradual_rt.ind "gradual_prog.tree#tree" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         Gradual_rt.anil))
     tr
 
@@ -1004,30 +1081,30 @@ let t_tree _ =
 let tr_bad =
   Node
     ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-       Gradual_rt.unknown_ty (succ 0)),
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+       Gradual_rt.unknown_ty (S O)),
     (Fcons ((Node
     ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-       (Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil)
+       (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil)
        Gradual_rt.unknown_ty true),
     Fnil)), Fnil)))
 
-(** val t_tree_bad : unit -> int tree **)
+(** val t_tree_bad : unit -> nat tree **)
 
 let t_tree_bad _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "gradual_prog.tree#forest" (fun src tgt v ->
-      match Obj.magic v with
+      match Gradual_rt.check (Obj.magic v) with
       | Fnil ->
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Fnil)
       | Fcons (x, x0) ->
         let x1 =
           Gradual_rt.cast
-            (Gradual_rt.ind "gradual_prog.tree#tree"
+            (Gradual_rt.ind "gradual_prog.tree#tree" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "gradual_prog.tree#tree"
+            (Gradual_rt.ind "gradual_prog.tree#tree" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
@@ -1035,11 +1112,11 @@ let t_tree_bad _ =
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "gradual_prog.tree#forest"
+            (Gradual_rt.ind "gradual_prog.tree#forest" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "gradual_prog.tree#forest"
+            (Gradual_rt.ind "gradual_prog.tree#forest" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
@@ -1048,18 +1125,18 @@ let t_tree_bad _ =
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
           (Obj.magic (Fcons ((Obj.magic x1), (Obj.magic x2)))))
       (Gradual_rt.rcons "gradual_prog.tree#tree" (fun src tgt v ->
-        let Node (x, x0) = Obj.magic v in
+        let Node (x, x0) = Gradual_rt.check (Obj.magic v) in
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "gradual_prog.tree#forest"
+            (Gradual_rt.ind "gradual_prog.tree#forest" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "gradual_prog.tree#forest"
+            (Gradual_rt.ind "gradual_prog.tree#forest" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
@@ -1068,14 +1145,19 @@ let t_tree_bad _ =
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
           (Obj.magic (Node ((Obj.magic x1), (Obj.magic x2)))))
         Gradual_rt.rnil))
-    (Gradual_rt.ind "gradual_prog.tree#tree"
+    (Gradual_rt.ind "gradual_prog.tree#tree" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "gradual_prog.tree#tree"
+    (Gradual_rt.ind "gradual_prog.tree#tree" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         Gradual_rt.anil))
     tr_bad
+
+(** val t_tree_bad_root : unit -> nat **)
+
+let t_tree_bad_root _ =
+  let Node (x, _) = Gradual_rt.check (t_tree_bad ()) in x
 
 type 'a rose =
 | Rnode of 'a * 'a rose list
@@ -1085,60 +1167,60 @@ type 'a rose =
 let ro =
   Rnode
     ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-       Gradual_rt.unknown_ty (succ 0)),
-    ((Rnode
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+       Gradual_rt.unknown_ty (S O)),
+    (Cons ((Rnode
     ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil
-       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-       Gradual_rt.unknown_ty (succ (succ 0))),
-    []))::[]))
+       (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+       Gradual_rt.unknown_ty (S (S O))),
+    Nil)), Nil)))
 
-(** val t_rose : unit -> int rose **)
+(** val t_rose : unit -> nat rose **)
 
 let t_rose _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.list" (fun src tgt v ->
-      match Obj.magic v with
-      | [] -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic [])
-      | x::x0 ->
+      match Gradual_rt.check (Obj.magic v) with
+      | Nil -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Nil)
+      | Cons (x, x0) ->
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
             (Obj.magic x0)
         in
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
-          (Obj.magic ((Obj.magic x1)::(Obj.magic x2))))
+          (Obj.magic (Cons ((Obj.magic x1), (Obj.magic x2)))))
       (Gradual_rt.rcons "gradual_prog.rose" (fun src tgt v ->
-        let Rnode (x, x0) = Obj.magic v in
+        let Rnode (x, x0) = Gradual_rt.check (Obj.magic v) in
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg
-                  (Gradual_rt.ind "gradual_prog.rose"
+                  (Gradual_rt.ind "gradual_prog.rose" true
                     (Gradual_rt.acons
                       (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                       Gradual_rt.anil)))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg
-                  (Gradual_rt.ind "gradual_prog.rose"
+                  (Gradual_rt.ind "gradual_prog.rose" true
                     (Gradual_rt.acons
                       (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                       Gradual_rt.anil)))
@@ -1148,54 +1230,71 @@ let t_rose _ =
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
           (Obj.magic (Rnode ((Obj.magic x1), (Obj.magic x2)))))
         Gradual_rt.rnil))
-    (Gradual_rt.ind "gradual_prog.rose"
+    (Gradual_rt.ind "gradual_prog.rose" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "gradual_prog.rose"
+    (Gradual_rt.ind "gradual_prog.rose" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         Gradual_rt.anil))
     ro
 
-(** val t_unk : unit -> int **)
+(** val t_unk : unit -> nat **)
 
 let t_unk _ =
   Obj.magic Gradual_rt.unknown_term
-    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
+    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
 
-(** val t_unk_fun : unit -> int **)
+(** val t_unk_fun : unit -> nat **)
 
 let t_unk_fun _ =
   Obj.magic Gradual_rt.unknown_term
     (Gradual_rt.pi
-      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil) (fun _ ->
-      Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
-    (succ (succ (succ 0)))
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+      (fun _ ->
+      Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+    (S (S (S O)))
 
-(** val t_unk_dyn : unit -> int **)
+(** val t_unk_dyn : unit -> nat **)
 
 let t_unk_dyn _ =
   succ_dyn (Obj.magic Gradual_rt.unknown_term Gradual_rt.unknown_ty)
 
-(** val t_err : unit -> int **)
+(** val t_unk_plus : unit -> nat **)
+
+let t_unk_plus _ =
+  add (S (S O))
+    (Obj.magic Gradual_rt.unknown_term
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+
+(** val t_unk_elim : unit -> nat **)
+
+let t_unk_elim _ =
+  add
+    (Obj.magic Gradual_rt.unknown_term
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
+    (S (S O))
+
+(** val t_err : unit -> nat **)
 
 let t_err _ =
   Obj.magic Gradual_rt.err_term
-    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
+    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
 
-(** val t_err_fun : unit -> int -> int **)
+(** val t_err_fun : unit -> nat -> nat **)
 
 let t_err_fun _ =
   Obj.magic Gradual_rt.err_term
     (Gradual_rt.pi
-      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil) (fun _ ->
-      Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+      (fun _ ->
+      Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
 
-(** val t_sort_bad : unit -> int **)
+(** val t_sort_bad : unit -> nat **)
 
 let t_sort_bad _ =
   Obj.magic Gradual_rt.cast_with Gradual_rt.rnil (Gradual_rt.sort 2)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil) __
+    (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil) __
 
 (** val delta : __ -> __ **)
 
@@ -1228,31 +1327,39 @@ let roundtrip a b x =
 
 (** val dyns : __ -> 'a1 list -> __ list **)
 
-let rec dyns a = function
-| [] -> []
-| x::r -> (to_dyn (Obj.magic a) x)::(dyns (Obj.magic a) r)
+let rec dyns a l =
+  match Gradual_rt.check l with
+  | Nil -> Nil
+  | Cons (x, r) -> Cons ((to_dyn (Obj.magic a) x), (dyns (Obj.magic a) r))
 
 (** val dyns_local : __ -> 'a1 list -> __ list **)
 
-let rec dyns_local a = function
-| [] -> []
-| x::r ->
-  (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil a Gradual_rt.unknown_ty x)::
-    (dyns_local a r)
+let rec dyns_local a l =
+  match Gradual_rt.check l with
+  | Nil -> Nil
+  | Cons (x, r) ->
+    Cons
+      ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil a
+         Gradual_rt.unknown_ty x),
+      (dyns_local a r))
 
 (** val ev : __ -> 'a1 list -> __ list **)
 
-let rec ev a = function
-| [] -> []
-| x::r -> (to_dyn (Obj.magic a) x)::(od (Obj.magic a) r)
+let rec ev a l =
+  match Gradual_rt.check l with
+  | Nil -> Nil
+  | Cons (x, r) -> Cons ((to_dyn (Obj.magic a) x), (od (Obj.magic a) r))
 
 (** val od : __ -> 'a1 list -> __ list **)
 
-and od a = function
-| [] -> []
-| x::r ->
-  (Obj.magic Gradual_rt.cast_with Gradual_rt.rnil a Gradual_rt.unknown_ty x)::
-    (ev (Obj.magic a) r)
+and od a l =
+  match Gradual_rt.check l with
+  | Nil -> Nil
+  | Cons (x, r) ->
+    Cons
+      ((Obj.magic Gradual_rt.cast_with Gradual_rt.rnil a
+         Gradual_rt.unknown_ty x),
+      (ev (Obj.magic a) r))
 
 (** val poly_fun : __ -> ('a1 -> 'a1) -> __ **)
 
@@ -1261,217 +1368,227 @@ let poly_fun a f =
     (Gradual_rt.pi (Obj.magic a) (fun _ -> Obj.magic a))
     Gradual_rt.unknown_ty f
 
-(** val t_poly : unit -> int **)
+(** val t_poly : unit -> nat **)
 
 let t_poly _ =
   roundtrip
-    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-    (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ
-    (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ
-    (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ
-    (succ (succ (succ (succ (succ 0)))))))))))))))))))))))))))))))))))))))))
+    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
+      Gradual_rt.anil)
+    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
+      Gradual_rt.anil)
+    (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S
+    (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S
+    O)))))))))))))))))))))))))))))))))))))))))
 
 (** val t_poly_bad : unit -> bool **)
 
 let t_poly_bad _ =
   roundtrip
-    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil)
-    (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ
-    (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ
-    (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ (succ
-    (succ (succ (succ (succ (succ 0)))))))))))))))))))))))))))))))))))))))))
+    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
+      Gradual_rt.anil)
+    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.bool" false
+      Gradual_rt.anil)
+    (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S
+    (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S (S
+    O)))))))))))))))))))))))))))))))))))))))))
 
-(** val t_poly_list : unit -> int list **)
+(** val t_poly_list : unit -> nat list **)
 
 let t_poly_list _ =
   of_dyn
-    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         Gradual_rt.anil))
     (to_dyn
-      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.list"
+      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.list" true
         (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
       (dyns
-        (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat"
+        (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
           Gradual_rt.anil)
-        ((succ 0)::((succ (succ 0))::[]))))
+        (Cons ((S O), (Cons ((S (S O)), Nil))))))
 
-(** val t_poly_rec : unit -> int list **)
+(** val t_poly_rec : unit -> nat list **)
 
 let t_poly_rec _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.list" (fun src tgt v ->
-      match Obj.magic v with
-      | [] -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic [])
-      | x::x0 ->
+      match Gradual_rt.check (Obj.magic v) with
+      | Nil -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Nil)
+      | Cons (x, x0) ->
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
             (Obj.magic x0)
         in
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
-          (Obj.magic ((Obj.magic x1)::(Obj.magic x2))))
+          (Obj.magic (Cons ((Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         Gradual_rt.anil))
     (dyns
-      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-      ((succ 0)::((succ (succ 0))::[])))
+      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
+        Gradual_rt.anil)
+      (Cons ((S O), (Cons ((S (S O)), Nil)))))
 
 (** val t_poly_rec_bad : unit -> bool list **)
 
 let t_poly_rec_bad _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.list" (fun src tgt v ->
-      match Obj.magic v with
-      | [] -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic [])
-      | x::x0 ->
+      match Gradual_rt.check (Obj.magic v) with
+      | Nil -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Nil)
+      | Cons (x, x0) ->
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
             (Obj.magic x0)
         in
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
-          (Obj.magic ((Obj.magic x1)::(Obj.magic x2))))
+          (Obj.magic (Cons ((Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil))
         Gradual_rt.anil))
     (dyns
-      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-      ((succ 0)::((succ (succ 0))::[])))
+      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
+        Gradual_rt.anil)
+      (Cons ((S O), (Cons ((S (S O)), Nil)))))
 
 (** val t_poly_local : unit -> bool list **)
 
 let t_poly_local _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.list" (fun src tgt v ->
-      match Obj.magic v with
-      | [] -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic [])
-      | x::x0 ->
+      match Gradual_rt.check (Obj.magic v) with
+      | Nil -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Nil)
+      | Cons (x, x0) ->
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
             (Obj.magic x0)
         in
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
-          (Obj.magic ((Obj.magic x1)::(Obj.magic x2))))
+          (Obj.magic (Cons ((Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.bool" false Gradual_rt.anil))
         Gradual_rt.anil))
     (dyns_local
-      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil)
-      (true::[]))
+      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.bool" false
+        Gradual_rt.anil)
+      (Cons (true, Nil)))
 
-(** val t_poly_mutual : unit -> int list **)
+(** val t_poly_mutual : unit -> nat list **)
 
 let t_poly_mutual _ =
   Obj.magic Gradual_rt.cast_with
     (Gradual_rt.rcons "Corelib.Init.Datatypes.list" (fun src tgt v ->
-      match Obj.magic v with
-      | [] -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic [])
-      | x::x0 ->
+      match Gradual_rt.check (Obj.magic v) with
+      | Nil -> Gradual_rt.check_indices tgt 1 Gradual_rt.anil (Obj.magic Nil)
+      | Cons (x, x0) ->
         let x1 =
           Gradual_rt.cast (Gradual_rt.param_ty src 0)
             (Gradual_rt.param_ty tgt 0) (Obj.magic x)
         in
         let x2 =
           Gradual_rt.cast
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty src 0))
                 Gradual_rt.anil))
-            (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+            (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
               (Gradual_rt.acons
                 (Gradual_rt.ty_arg (Gradual_rt.param_ty tgt 0))
                 Gradual_rt.anil))
             (Obj.magic x0)
         in
         Gradual_rt.check_indices tgt 1 Gradual_rt.anil
-          (Obj.magic ((Obj.magic x1)::(Obj.magic x2))))
+          (Obj.magic (Cons ((Obj.magic x1), (Obj.magic x2)))))
       Gradual_rt.rnil)
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons Gradual_rt.unk_arg Gradual_rt.anil))
-    (Gradual_rt.ind "Corelib.Init.Datatypes.list"
+    (Gradual_rt.ind "Corelib.Init.Datatypes.list" true
       (Gradual_rt.acons
         (Gradual_rt.ty_arg
-          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+          (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
         Gradual_rt.anil))
     (ev
-      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-      ((succ 0)::((succ (succ 0))::((succ (succ (succ 0)))::[]))))
+      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
+        Gradual_rt.anil)
+      (Cons ((S O), (Cons ((S (S O)), (Cons ((S (S (S O))), Nil)))))))
 
-(** val t_poly_fun : unit -> int **)
+(** val t_poly_fun : unit -> nat **)
 
 let t_poly_fun _ =
   of_dyn
     (Obj.magic Gradual_rt.pi
-      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil) (fun _ ->
-      Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+      (fun _ ->
+      Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
     (poly_fun
-      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil)
-      (fun x -> succ x))
-    (succ 0)
+      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.nat" true
+        Gradual_rt.anil)
+      (fun x -> S x))
+    (S O)
 
-(** val t_poly_fun_bad : unit -> int **)
+(** val t_poly_fun_bad : unit -> nat **)
 
 let t_poly_fun_bad _ =
   of_dyn
     (Obj.magic Gradual_rt.pi
-      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil) (fun _ ->
-      Gradual_rt.ind "Corelib.Init.Datatypes.nat" Gradual_rt.anil))
+      (Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil)
+      (fun _ ->
+      Gradual_rt.ind "Corelib.Init.Datatypes.nat" true Gradual_rt.anil))
     (poly_fun
-      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.bool" Gradual_rt.anil)
+      (Obj.magic Gradual_rt.ind "Corelib.Init.Datatypes.bool" false
+        Gradual_rt.anil)
       negb)
-    (succ 0)
+    (S O)
