@@ -156,6 +156,31 @@ if want entropy; then
         solo5-hvt --mem=64 --no-random -- "${U}/dist/entropy.hvt"
 fi
 
+if want gradual; then
+    # Code extracted from gradual Rocq checks its casts at run time and
+    # agrees with the kernel...
+    U="${HERE}/unikernels/gradual"
+    build "${U}" &&
+    check gradual "gradual: all [0-9]+ cases agree with the kernel" \
+        solo5-hvt --mem=32 -- "${U}/dist/gradual.hvt" && {
+        # ...and Omega, well typed there, never terminates: --cpu-limit
+        # stops it.
+        timeout 30 solo5-hvt --mem=32 --cpu-limit=2 --exit-report=3 -- \
+            "${U}/dist/gradual.hvt" --omega \
+            3>"${WORK}/omega.json" >"${WORK}/omega.log" 2>&1
+        if grep -q '"reason":"cpu_limit"' "${WORK}/omega.json" &&
+            grep -q "gradual: running Omega" "${WORK}/omega.log"; then
+            echo "PASS gradual-omega (stopped by --cpu-limit)"
+            PASS=$((PASS + 1))
+        else
+            echo "FAIL gradual-omega: $(cat "${WORK}/omega.json")"
+            sed 's/^/    /' "${WORK}/omega.log" | tail -5
+            FAIL=$((FAIL + 1))
+            FAILED="${FAILED} gradual-omega"
+        fi
+    }
+fi
+
 if want sandbox-cpu-limit; then
     # A guest that never returns is stopped by --cpu-limit and reported.
     build device-usage/clock

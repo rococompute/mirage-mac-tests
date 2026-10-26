@@ -12,6 +12,8 @@ unikernels (plus the ones in `unikernels/`) for `hvt` on this Mac and runs them 
 | `crypto` | mirage-crypto C and assembly code, RSA 4096 keygen, sign, verify |
 | `entropy` | the RNG is seeded from the host (`solo5_random`, source `solo5-host`) |
 | `entropy-fallback` | under `solo5-hvt --no-random` the same unikernel boots on its own sources |
+| `gradual` | code extracted from [gradual Rocq](unikernels/gradual/gradual_prog.v) checks its casts at run time, with the kernel's results |
+| `gradual-omega` | Omega, well typed in gradual Rocq, never terminates and is stopped by `--cpu-limit` |
 | `sandbox-cpu-limit` | an idle guest is not stopped by `--cpu-limit` |
 | `dns` | DHCP and DNS over vmnet (`solo5-vmnet`) |
 | `https-fetch` | DNS, TCP and TLS to the internet through vmnet NAT |
