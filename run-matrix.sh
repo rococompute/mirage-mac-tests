@@ -158,11 +158,15 @@ fi
 
 if want gradual; then
     # Code extracted from gradual Rocq checks its casts at run time and
-    # agrees with the kernel...
+    # agrees with the kernel, also for casts at type parameters (passed
+    # at run time)...
     U="${HERE}/unikernels/gradual"
-    build "${U}" &&
-    check gradual "gradual: all [0-9]+ cases agree with the kernel" \
-        solo5-hvt --mem=32 -- "${U}/dist/gradual.hvt" && {
+    build "${U}" && {
+        check gradual "gradual: all [0-9]+ cases agree with the kernel" \
+            solo5-hvt --mem=32 -- "${U}/dist/gradual.hvt"
+        check gradual-poly \
+            "gradual: all [0-9]+ polymorphic cases agree with the kernel" \
+            solo5-hvt --mem=32 -- "${U}/dist/gradual.hvt"
         # ...and Omega, well typed there, never terminates: --cpu-limit
         # stops it.
         timeout 30 solo5-hvt --mem=32 --cpu-limit=2 --exit-report=3 -- \

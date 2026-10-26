@@ -13,6 +13,7 @@ unikernels (plus the ones in `unikernels/`) for `hvt` on this Mac and runs them 
 | `entropy` | the RNG is seeded from the host (`solo5_random`, source `solo5-host`) |
 | `entropy-fallback` | under `solo5-hvt --no-random` the same unikernel boots on its own sources |
 | `gradual` | code extracted from [gradual Rocq](unikernels/gradual/gradual_prog.v) checks its casts at run time, with the kernel's results |
+| `gradual-poly` | the same for casts at type parameters, whose runtime descriptions the extracted functions take as arguments |
 | `gradual-omega` | Omega, well typed in gradual Rocq, never terminates and is stopped by `--cpu-limit` |
 | `sandbox-cpu-limit` | an idle guest is not stopped by `--cpu-limit` |
 | `dns` | DHCP and DNS over vmnet (`solo5-vmnet`) |

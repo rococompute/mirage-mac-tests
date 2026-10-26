@@ -1,6 +1,8 @@
 (* Runs the cases of gradual_prog.v and compares each result with the one
-   the Rocq kernel computes (the [Goal]s there). With --omega, runs Omega,
-   which is well typed in gradual Rocq and never terminates. *)
+   the Rocq kernel computes (the [Goal]s there): first casts at closed
+   types, then casts at type parameters, whose runtime descriptions the
+   extracted functions take as arguments. With --omega, runs Omega, which
+   is well typed in gradual Rocq and never terminates. *)
 open Gradual_prog
 
 let omega =
@@ -34,11 +36,24 @@ let cases = [
   "cast Type nat bool", (fun () -> string_of_int (t_sort_bad ())), "raise";
 ]
 
-let start () =
-  if omega () then begin
-    Logs.info (fun f -> f "gradual: running Omega");
-    ignore (t_omega ())
-  end;
+let bools l = "[" ^ String.concat "; " (List.map string_of_bool l) ^ "]"
+
+(* casts at type parameters (the extracted code raises where the kernel
+   keeps [raise] inside data) *)
+let poly_cases = [
+  "roundtrip 41 : nat", (fun () -> string_of_int (t_poly ())), "41";
+  "roundtrip 41 : bool", (fun () -> string_of_bool (t_poly_bad ())), "raise";
+  "of_dyn (to_dyn (dyns l)) : list nat", (fun () -> ints (t_poly_list ())), "[1; 2]";
+  "dyns [1; 2] : list nat", (fun () -> ints (t_poly_rec ())), "[1; 2]";
+  "dyns [1; 2] : list bool", (fun () -> bools (t_poly_rec_bad ())), "raise";
+  "local fix at A : list bool", (fun () -> bools (t_poly_local ())), "[true]";
+  "mutual fixpoints at A", (fun () -> ints (t_poly_mutual ())), "[1; 2; 3]";
+  "poly_fun S : nat -> nat", (fun () -> string_of_int (t_poly_fun ())), "2";
+  "poly_fun negb : nat -> nat", (fun () -> string_of_int (t_poly_fun_bad ())), "raise";
+]
+
+(* Logs each case, then a summary line that run-matrix.sh looks for. *)
+let check what cases =
   let ok =
     List.fold_left (fun ok (name, f, expected) ->
         let got = run f in
@@ -47,6 +62,14 @@ let start () =
         ok + if got = expected then 1 else 0) 0 cases
   in
   let n = List.length cases in
-  if ok = n then Logs.info (fun f -> f "gradual: all %d cases agree with the kernel" n)
-  else Logs.err (fun f -> f "gradual: %d of %d cases disagree with the kernel" (n - ok) n);
+  if ok = n then Logs.info (fun f -> f "gradual: all %d %s agree with the kernel" n what)
+  else Logs.err (fun f -> f "gradual: %d of %d %s disagree with the kernel" (n - ok) n what)
+
+let start () =
+  if omega () then begin
+    Logs.info (fun f -> f "gradual: running Omega");
+    ignore (t_omega ())
+  end;
+  check "cases" cases;
+  check "polymorphic cases" poly_cases;
   Lwt.return_unit

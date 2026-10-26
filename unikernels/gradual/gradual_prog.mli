@@ -108,3 +108,37 @@ val t_sort_bad : unit -> int
 val delta : __ -> __
 
 val t_omega : unit -> __
+
+val to_dyn : __ -> 'a1 -> __
+
+val of_dyn : __ -> __ -> 'a1
+
+val roundtrip : __ -> __ -> 'a1 -> 'a2
+
+val dyns : __ -> 'a1 list -> __ list
+
+val dyns_local : __ -> 'a1 list -> __ list
+
+val ev : __ -> 'a1 list -> __ list
+
+val od : __ -> 'a1 list -> __ list
+
+val poly_fun : __ -> ('a1 -> 'a1) -> __
+
+val t_poly : unit -> int
+
+val t_poly_bad : unit -> bool
+
+val t_poly_list : unit -> int list
+
+val t_poly_rec : unit -> int list
+
+val t_poly_rec_bad : unit -> bool list
+
+val t_poly_local : unit -> bool list
+
+val t_poly_mutual : unit -> int list
+
+val t_poly_fun : unit -> int
+
+val t_poly_fun_bad : unit -> int
