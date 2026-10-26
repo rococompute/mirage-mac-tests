@@ -54,17 +54,32 @@ FAIL=0
 SKIP=0
 FAILED=""
 
-# build DIR: configure and build the unikernel in skeleton/DIR for hvt.
+# build DIR: configure and build the unikernel in skeleton/DIR (or in DIR, if
+# it is an absolute path) for hvt.
 build()
 {
     [ "${BUILD}" = 1 ] || return 0
+    case "$1" in
+        /*) dir="$1" ;;
+        *) dir="${SKELETON}/$1" ;;
+    esac
+    # opam-monorepo deletes an existing duniverse/ before pulling, and fails
+    # with "Directory not empty" when macOS (Finder) writes a .DS_Store into
+    # it meanwhile. Renaming it out of the way is atomic.
     (
-        cd "${SKELETON}/$1" &&
+        if [ -d "${dir}/duniverse" ]; then
+            mv "${dir}/duniverse" "$(mktemp -d "${WORK}/old-duniverse.XXXXXX")" ||
+                exit 1
+        fi
+        cd "${dir}" &&
         mirage configure -t hvt >"${WORK}/build.log" 2>&1 &&
         make depends >>"${WORK}/build.log" 2>&1 &&
         make build >>"${WORK}/build.log" 2>&1
     ) || {
-        tail -20 "${WORK}/build.log" >&2
+        echo "FAIL build $1"
+        sed 's/^/    /' "${WORK}/build.log" | tail -20
+        FAIL=$((FAIL + 1))
+        FAILED="${FAILED} build:$1"
         return 1
     }
 }
@@ -128,6 +143,17 @@ if want crypto; then
     build applications/crypto &&
     check crypto "Generated a RSA key of 4096 bits \(sign \+ verify true\)" \
         solo5-hvt --mem=64 -- "${S}/applications/crypto/dist/crypto-test.hvt"
+fi
+
+if want entropy; then
+    # The RNG is seeded and fed from the host (solo5_random)...
+    U="${HERE}/unikernels/entropy"
+    build "${U}" &&
+    check entropy "entropy sources: \[0\] solo5-host" \
+        solo5-hvt --mem=64 -- "${U}/dist/entropy.hvt" &&
+    # ...and still boots, on its own sources, on a tender without it.
+    check entropy-fallback "solo5_random unavailable" \
+        solo5-hvt --mem=64 --no-random -- "${U}/dist/entropy.hvt"
 fi
 
 if want sandbox-cpu-limit; then
