@@ -134,6 +134,12 @@ val t_err_fun : unit -> nat -> nat
 
 val t_sort_bad : unit -> nat
 
+val t_int : unit -> Uint63.t
+
+val t_int_bad : unit -> nat
+
+val t_int_float : unit -> float
+
 val delta : __ -> __
 
 val t_omega : unit -> __
