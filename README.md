@@ -39,6 +39,10 @@ the snapshot; `--no-build` reuses existing artifacts.
 To check the committed gradual extraction without modifying it, run
 `ROCQ=/path/to/gradual-rocq/bin/rocq unikernels/gradual/extract.sh --check`.
 This requires the gradual fork of Rocq and fails if either generated file differs.
+The fixture uses the current `Any` type from `Corelib.Gradual.Gradual`.
+With `ocamlfind`, `cmdliner`, `logs.fmt`, and `lwt` available, run
+`ROCQ=/path/to/gradual-rocq/bin/rocq tests/gradual.sh` to check extraction,
+run the unikernel's 25 case expectations on the host, and bound its Omega case.
 
 The network cases need macOS 26 (vmnet without root) and outbound internet
 access.
