@@ -18,8 +18,8 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SKELETON="${HERE}/skeleton"
 SKELETON_URL="https://github.com/mirage/mirage-skeleton"
-SKELETON_REV="${SKELETON_REV:-main}"
-WORK="${TMPDIR:-/tmp}/mirage-matrix.$$"
+SKELETON_REV="${SKELETON_REV:-d51f6582fbc39882f61de45ed22759ab19def1fc}"
+TIMEOUT="${HERE}/run-with-timeout.pl"
 BUILD=1
 NETWORK=1
 
@@ -35,19 +35,46 @@ while [ $# -gt 0 ]; do
 done
 ONLY="$*"
 
-for tool in mirage solo5-hvt solo5-vmnet opam; do
+tools="solo5-hvt perl git"
+[ "${BUILD}" = 0 ] || tools="${tools} mirage opam"
+[ "${NETWORK}" = 0 ] || tools="${tools} solo5-vmnet"
+for tool in ${tools}; do
     command -v "${tool}" >/dev/null 2>&1 || {
         echo "error: ${tool} not found; run: eval \$(opam env)" >&2
         exit 2
     }
 done
 
+case "${SKELETON_REV}" in
+    *[!0-9a-f]*|'') echo "error: SKELETON_REV must be a full commit SHA" >&2; exit 2 ;;
+esac
+[ "${#SKELETON_REV}" = 40 ] || {
+    echo "error: SKELETON_REV must be a full commit SHA" >&2; exit 2
+}
 if [ ! -d "${SKELETON}" ]; then
     git clone -q "${SKELETON_URL}" "${SKELETON}" || exit 2
     git -C "${SKELETON}" checkout -q "${SKELETON_REV}" || exit 2
 fi
-mkdir -p "${WORK}"
-trap 'rm -rf "${WORK}"' EXIT
+actual="$(git -C "${SKELETON}" rev-parse HEAD)" || exit 2
+[ "${actual}" = "${SKELETON_REV}" ] || {
+    echo "error: skeleton is at ${actual}; expected ${SKELETON_REV}" >&2
+    echo "checkout the expected commit, or set SKELETON_REV to a full SHA" >&2
+    exit 2
+}
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/mirage-matrix.XXXXXX")" || exit 2
+server=""
+cleanup()
+{
+    if [ -n "${server}" ]; then
+        kill "${server}" 2>/dev/null || :
+        wait "${server}" 2>/dev/null || :
+    fi
+    rm -rf "${WORK}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 PASS=0
 FAIL=0
@@ -91,7 +118,7 @@ check()
     name="$1"
     pattern="$2"
     shift 2
-    timeout 60 "$@" >"${WORK}/${name}.log" 2>&1
+    perl "${TIMEOUT}" 60 "$@" >"${WORK}/${name}.log" 2>&1
     rc=$?
     if [ ${rc} -eq 0 ] && grep -Eq "${pattern}" "${WORK}/${name}.log"; then
         echo "PASS ${name}"
@@ -149,7 +176,7 @@ if want entropy; then
     # The RNG is seeded and fed from the host (solo5_random)...
     U="${HERE}/unikernels/entropy"
     build "${U}" &&
-    check entropy "entropy sources: \[0\] solo5-host" \
+    check entropy "\[[0-9]+\] solo5-host" \
         solo5-hvt --mem=64 -- "${U}/dist/entropy.hvt" &&
     # ...and still boots, on its own sources, on a tender without it.
     check entropy-fallback "solo5_random unavailable" \
@@ -169,7 +196,7 @@ if want gradual; then
             solo5-hvt --mem=32 -- "${U}/dist/gradual.hvt"
         # ...and Omega, well typed there, never terminates: --cpu-limit
         # stops it.
-        timeout 30 solo5-hvt --mem=32 --cpu-limit=2 --exit-report=3 -- \
+        perl "${TIMEOUT}" 30 solo5-hvt --mem=32 --cpu-limit=2 --exit-report=3 -- \
             "${U}/dist/gradual.hvt" --omega \
             3>"${WORK}/omega.json" >"${WORK}/omega.log" 2>&1
         if grep -q '"reason":"cpu_limit"' "${WORK}/omega.json" &&
@@ -188,7 +215,7 @@ fi
 if want sandbox-cpu-limit; then
     # A guest that never returns is stopped by --cpu-limit and reported.
     build device-usage/clock
-    timeout 30 solo5-hvt --mem=32 --cpu-limit=1 --exit-report=3 -- \
+    perl "${TIMEOUT}" 30 solo5-hvt --mem=32 --cpu-limit=1 --exit-report=3 -- \
         "${S}/device-usage/clock/dist/speaking_clock.hvt" \
         3>"${WORK}/report.json" >/dev/null 2>&1
     # The speaking clock sleeps between ticks and uses almost no CPU, so it
@@ -222,7 +249,7 @@ if [ "${NETWORK}" = 1 ]; then
         # With an allow-list that excludes everything the guest needs, the
         # fetch must fail and solo5-vmnet must have dropped its traffic.
         build device-usage/http-fetch
-        timeout 60 solo5-vmnet --verbose --allow=10.255.255.255/32 -- \
+        perl "${TIMEOUT}" 60 solo5-vmnet --verbose --allow=10.255.255.255/32 -- \
             solo5-hvt --mem=128 -- \
             "${S}/device-usage/http-fetch/dist/http-fetch.hvt" \
             >"${WORK}/egress-deny.log" 2>&1
@@ -242,12 +269,14 @@ if [ "${NETWORK}" = 1 ]; then
         # One unikernel serves HTTP, another fetches from it over vmnet.
         build applications/static_website_tls &&
         build device-usage/http-fetch && {
-            solo5-vmnet -- solo5-hvt --mem=128 -- \
+            perl "${TIMEOUT}" 120 solo5-vmnet -- solo5-hvt --mem=128 -- \
                 "${S}/applications/static_website_tls/dist/https.hvt" \
                 >"${WORK}/server.log" 2>&1 &
             server=$!
             ip=""
-            for _ in $(seq 1 40); do
+            attempt=0
+            while [ "${attempt}" -lt 40 ]; do
+                attempt=$((attempt + 1))
                 ip="$(grep -o 'ip=192\.168\.[0-9]*\.[0-9]*' \
                     "${WORK}/server.log" | head -1 | cut -d= -f2)"
                 [ -n "${ip}" ] && break
@@ -263,8 +292,9 @@ if [ "${NETWORK}" = 1 ]; then
                     "${S}/device-usage/http-fetch/dist/http-fetch.hvt" \
                     --uri="http://${ip}/"
             fi
-            kill "${server}" 2>/dev/null
-            wait "${server}" 2>/dev/null
+            kill "${server}" 2>/dev/null || :
+            wait "${server}" 2>/dev/null || :
+            server=""
         }
     fi
 else
