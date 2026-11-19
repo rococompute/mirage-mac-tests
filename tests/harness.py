@@ -89,6 +89,22 @@ class Harness(unittest.TestCase):
         result = self.run_cmd(['sh', str(self.root / 'run-matrix.sh'), '--no-build', '--no-network', 'entropy'], env=env)
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn('expected ' + '0' * 40, result.stdout)
+        # Interrupt a foreground case and verify the entire tender tree ends.
+        env['SKELETON_REV'] = rev
+        pids = self.root / 'interrupted.pids'
+        tender.write_text(f'#!/bin/sh\nsleep 60 & echo $$ $! > "{pids}"\nwait\n')
+        proc = subprocess.Popen(['sh', str(self.root / 'run-matrix.sh'), '--no-build',
+                                 '--no-network', 'entropy'], env=env, stdout=subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        for _ in range(100):
+            if pids.exists():
+                break
+            time.sleep(.01)
+        self.assertTrue(pids.exists())
+        proc.send_signal(signal.SIGTERM)
+        self.assertEqual(proc.wait(timeout=5), 143)
+        for pid in map(int, pids.read_text().split()):
+            self.assert_dead(pid)
 
     def test_extraction_check_preserves_outputs(self):
         source = ROOT / 'unikernels/gradual'

@@ -63,8 +63,13 @@ actual="$(git -C "${SKELETON}" rev-parse HEAD)" || exit 2
 }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mirage-matrix.XXXXXX")" || exit 2
 server=""
+runner=""
 cleanup()
 {
+    if [ -n "${runner}" ]; then
+        kill "${runner}" 2>/dev/null || :
+        wait "${runner}" 2>/dev/null || :
+    fi
     if [ -n "${server}" ]; then
         kill "${server}" 2>/dev/null || :
         wait "${server}" 2>/dev/null || :
@@ -75,6 +80,18 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+
+# Background the supervisor so a signal interrupts wait and the EXIT trap can
+# stop the active command immediately, including all of its descendants.
+run_timed()
+{
+    perl "${TIMEOUT}" "$@" &
+    runner=$!
+    wait "${runner}"
+    timed_status=$?
+    runner=""
+    return "${timed_status}"
+}
 
 PASS=0
 FAIL=0
@@ -118,7 +135,7 @@ check()
     name="$1"
     pattern="$2"
     shift 2
-    perl "${TIMEOUT}" 60 "$@" >"${WORK}/${name}.log" 2>&1
+    run_timed 60 "$@" >"${WORK}/${name}.log" 2>&1
     rc=$?
     if [ ${rc} -eq 0 ] && grep -Eq "${pattern}" "${WORK}/${name}.log"; then
         echo "PASS ${name}"
@@ -196,7 +213,7 @@ if want gradual; then
             solo5-hvt --mem=32 -- "${U}/dist/gradual.hvt"
         # ...and Omega, well typed there, never terminates: --cpu-limit
         # stops it.
-        perl "${TIMEOUT}" 30 solo5-hvt --mem=32 --cpu-limit=2 --exit-report=3 -- \
+        run_timed 30 solo5-hvt --mem=32 --cpu-limit=2 --exit-report=3 -- \
             "${U}/dist/gradual.hvt" --omega \
             3>"${WORK}/omega.json" >"${WORK}/omega.log" 2>&1
         if grep -q '"reason":"cpu_limit"' "${WORK}/omega.json" &&
@@ -215,7 +232,7 @@ fi
 if want sandbox-cpu-limit; then
     # A guest that never returns is stopped by --cpu-limit and reported.
     build device-usage/clock
-    perl "${TIMEOUT}" 30 solo5-hvt --mem=32 --cpu-limit=1 --exit-report=3 -- \
+    run_timed 30 solo5-hvt --mem=32 --cpu-limit=1 --exit-report=3 -- \
         "${S}/device-usage/clock/dist/speaking_clock.hvt" \
         3>"${WORK}/report.json" >/dev/null 2>&1
     # The speaking clock sleeps between ticks and uses almost no CPU, so it
@@ -249,7 +266,7 @@ if [ "${NETWORK}" = 1 ]; then
         # With an allow-list that excludes everything the guest needs, the
         # fetch must fail and solo5-vmnet must have dropped its traffic.
         build device-usage/http-fetch
-        perl "${TIMEOUT}" 60 solo5-vmnet --verbose --allow=10.255.255.255/32 -- \
+        run_timed 60 solo5-vmnet --verbose --allow=10.255.255.255/32 -- \
             solo5-hvt --mem=128 -- \
             "${S}/device-usage/http-fetch/dist/http-fetch.hvt" \
             >"${WORK}/egress-deny.log" 2>&1
