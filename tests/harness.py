@@ -77,6 +77,10 @@ class Harness(unittest.TestCase):
         tender = bindir / 'solo5-hvt'
         tender.write_text('#!/bin/sh\ncase "$*" in\n*--no-random*) echo "solo5_random unavailable";;\n*) echo "entropy sources: [1] rdrand, [7] solo5-host, [2] timer";;\nesac\n')
         tender.chmod(0o755)
+        for name in ('mirage', 'opam'):
+            tool = bindir / name
+            tool.write_text('#!/bin/sh\nexit 99\n')
+            tool.chmod(0o755)
         env = dict(os.environ, PATH=f'{bindir}:/usr/bin:/bin', SKELETON_REV=rev)
         result = self.run_cmd(['sh', str(self.root / 'run-matrix.sh'), '--no-build', '--no-network', 'entropy'], env=env)
         self.assertEqual(result.returncode, 0, result.stdout)
