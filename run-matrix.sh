@@ -18,7 +18,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SKELETON="${HERE}/skeleton"
 SKELETON_URL="https://github.com/mirage/mirage-skeleton"
-SKELETON_REV="${SKELETON_REV:-d51f6582fbc39882f61de45ed22759ab19def1fc}"
+SKELETON_REV="${SKELETON_REV:-52abe5aedb1f19f6dd3a18dc9ad81c766f813ebc}"
 TIMEOUT="${HERE}/run-with-timeout.pl"
 BUILD=1
 NETWORK=1

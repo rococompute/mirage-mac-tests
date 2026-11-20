@@ -31,7 +31,7 @@ eval $(opam env --switch <switch with the hvf-mac repository>)
 
 The harness uses the system Perl for timeouts and process-group cleanup; GNU
 coreutils are not required. It checks out mirage-skeleton commit
-`d51f6582fbc39882f61de45ed22759ab19def1fc`. An existing `skeleton/` must be at
+`52abe5aedb1f19f6dd3a18dc9ad81c766f813ebc`. An existing `skeleton/` must be at
 that commit. To test a different snapshot, set `SKELETON_REV` to its full 40-digit
 commit SHA and check out that commit in `skeleton/` first. Rebuild after changing
 the snapshot; `--no-build` reuses existing artifacts.
